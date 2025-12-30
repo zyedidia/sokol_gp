@@ -2378,6 +2378,15 @@ static sgp_vertex* _sgp_next_vertices(uint32_t count) {
         _sgp.cur_vertex += count;
         return vertices;
     } else {
+        // Auto-flush: sgp_flush() rewinds counters, then retry
+        if (_sgp.cur_state > 0) {
+            sgp_flush();
+            if (_sgp.cur_vertex + count <= _sgp.num_vertices) {
+                sgp_vertex *vertices = &_sgp.vertices[_sgp.cur_vertex];
+                _sgp.cur_vertex += count;
+                return vertices;
+            }
+        }
         _sgp_set_error(SGP_ERROR_VERTICES_FULL);
         return NULL;
     }
@@ -2395,6 +2404,13 @@ static sgp_uniform* _sgp_next_uniform(void) {
     if (SOKOL_LIKELY(_sgp.cur_uniform < _sgp.num_uniforms)) {
         return &_sgp.uniforms[_sgp.cur_uniform++];
     } else {
+        // Auto-flush: sgp_flush() rewinds counters, then retry
+        if (_sgp.cur_state > 0) {
+            sgp_flush();
+            if (_sgp.cur_uniform < _sgp.num_uniforms) {
+                return &_sgp.uniforms[_sgp.cur_uniform++];
+            }
+        }
         _sgp_set_error(SGP_ERROR_UNIFORMS_FULL);
         return NULL;
     }
@@ -2412,6 +2428,13 @@ static _sgp_command* _sgp_next_command(void) {
     if (SOKOL_LIKELY(_sgp.cur_command < _sgp.num_commands)) {
         return &_sgp.commands[_sgp.cur_command++];
     } else {
+        // Auto-flush: sgp_flush() rewinds counters, then retry
+        if (_sgp.cur_state > 0) {
+            sgp_flush();
+            if (_sgp.cur_command < _sgp.num_commands) {
+                return &_sgp.commands[_sgp.cur_command++];
+            }
+        }
         _sgp_set_error(SGP_ERROR_COMMANDS_FULL);
         return NULL;
     }
