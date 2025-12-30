@@ -739,6 +739,8 @@ typedef struct _sgp_context {
     // resources
     sg_shader shader;
     sg_buffer vertex_buf;
+    uint32_t gpu_buffer_vertices;  // capacity of GPU buffer in vertices
+    uint32_t gpu_buffer_used;      // vertices used in GPU buffer this frame
     sg_image white_img;
     sg_view white_view;
     sg_sampler nearest_smp;
@@ -1774,9 +1776,10 @@ void sgp_setup(const sgp_desc* desc) {
     memset(_sgp.commands, 0, _sgp.num_commands * sizeof(_sgp_command));
 
     // create vertex buffer
+    _sgp.gpu_buffer_vertices = _sgp.num_vertices;
     sg_buffer_desc vertex_buf_desc;
     memset(&vertex_buf_desc, 0, sizeof(sg_buffer_desc));
-    vertex_buf_desc.size = (size_t)(_sgp.num_vertices * sizeof(sgp_vertex));
+    vertex_buf_desc.size = (size_t)(_sgp.gpu_buffer_vertices * sizeof(sgp_vertex));
 	vertex_buf_desc.usage = (sg_buffer_usage){
       .vertex_buffer = true,
       .stream_update = true,
@@ -1967,6 +1970,11 @@ void sgp_begin(int width, int height) {
         return;
     }
 
+    // reset GPU buffer usage at start of frame (outermost begin)
+    if (_sgp.cur_state == 0) {
+        _sgp.gpu_buffer_used = 0;
+    }
+
     // begin reset last error
     _sgp.last_error = SGP_NO_ERROR;
 
@@ -2026,13 +2034,47 @@ void sgp_flush(void) {
 
     // upload vertices
     uint32_t base_vertex = _sgp.state._base_vertex;
-    uint32_t num_vertices = (end_vertex - base_vertex) * sizeof(sgp_vertex);
-    sg_range vertex_range = {&_sgp.vertices[base_vertex], num_vertices};
+    uint32_t vertex_count = end_vertex - base_vertex;
+    uint32_t num_vertices_bytes = vertex_count * sizeof(sgp_vertex);
+
+    // check if we need to resize the GPU buffer
+    uint32_t needed = _sgp.gpu_buffer_used + vertex_count;
+    if (needed > _sgp.gpu_buffer_vertices) {
+        // need to resize - double the size until it fits
+        uint32_t new_size = _sgp.gpu_buffer_vertices;
+        while (new_size < needed) {
+            new_size *= 2;
+        }
+
+        // create new larger buffer
+        sg_buffer_desc vertex_buf_desc;
+        memset(&vertex_buf_desc, 0, sizeof(sg_buffer_desc));
+        vertex_buf_desc.size = (size_t)(new_size * sizeof(sgp_vertex));
+        vertex_buf_desc.usage = (sg_buffer_usage){
+            .vertex_buffer = true,
+            .stream_update = true,
+        };
+
+        sg_buffer new_buf = sg_make_buffer(&vertex_buf_desc);
+        if (sg_query_buffer_state(new_buf) != SG_RESOURCESTATE_VALID) {
+            _sgp_set_error(SGP_ERROR_VERTICES_OVERFLOW);
+            return;
+        }
+
+        // destroy old buffer and use new one
+        sg_destroy_buffer(_sgp.vertex_buf);
+        _sgp.vertex_buf = new_buf;
+        _sgp.gpu_buffer_vertices = new_size;
+        _sgp.gpu_buffer_used = 0;  // new buffer is empty
+    }
+
+    sg_range vertex_range = {&_sgp.vertices[base_vertex], num_vertices_bytes};
     int offset = sg_append_buffer(_sgp.vertex_buf, &vertex_range);
     if (sg_query_buffer_overflow(_sgp.vertex_buf)) {
         _sgp_set_error(SGP_ERROR_VERTICES_OVERFLOW);
         return;
     }
+    _sgp.gpu_buffer_used += vertex_count;
 
     uint32_t cur_pip_id = _SGP_IMPOSSIBLE_ID;
     uint32_t cur_uniform_index = _SGP_IMPOSSIBLE_ID;
@@ -2771,11 +2813,11 @@ void sgp_clear(void) {
 
     // setup vertices
     uint32_t num_vertices = 6;
-    uint32_t vertex_index = _sgp.cur_vertex;
     sgp_vertex* vertices = _sgp_next_vertices(num_vertices);
     if (SOKOL_UNLIKELY(!vertices)) {
         return;
     }
+    uint32_t vertex_index = _sgp.cur_vertex - num_vertices;
 
     // compute vertices
     sgp_vertex* v = vertices;
@@ -2810,11 +2852,11 @@ void sgp_draw(sg_primitive_type primitive_type, const sgp_vertex* vertices, uint
     }
 
     // setup vertices
-    uint32_t vertex_index = _sgp.cur_vertex;
     sgp_vertex* v = _sgp_next_vertices(count);
     if (SOKOL_UNLIKELY(!v)) {
         return;
     }
+    uint32_t vertex_index = _sgp.cur_vertex - count;
 
     // fill vertices
     float thickness = (primitive_type == SG_PRIMITIVETYPE_POINTS || primitive_type == SG_PRIMITIVETYPE_LINES || primitive_type == SG_PRIMITIVETYPE_LINE_STRIP) ? _sgp.state.thickness : 0.0f;
@@ -2843,33 +2885,61 @@ static void _sgp_draw_solid_pip(sg_primitive_type primitive_type, const sgp_vec2
         return;
     }
 
-    // setup vertices
-    uint32_t vertex_index = _sgp.cur_vertex;
-    sgp_vertex* v = _sgp_next_vertices(num_vertices);
-    if (SOKOL_UNLIKELY(!v)) {
-        return;
+    // Determine primitive size for chunking (strip types cannot be chunked)
+    uint32_t prim_size = 1;
+    switch (primitive_type) {
+        case SG_PRIMITIVETYPE_POINTS: prim_size = 1; break;
+        case SG_PRIMITIVETYPE_LINES: prim_size = 2; break;
+        case SG_PRIMITIVETYPE_TRIANGLES: prim_size = 3; break;
+        default: prim_size = 0; break; // strips - cannot chunk
     }
 
-    // fill vertices
+    // Calculate max chunk size (use most of buffer, aligned to primitive size)
+    uint32_t max_chunk = _sgp.num_vertices - (_sgp.num_vertices / 8); // leave 12.5% headroom
+    if (prim_size > 0) {
+        max_chunk = (max_chunk / prim_size) * prim_size;
+    }
+
+    // Cache state for the loop
     float thickness = (primitive_type == SG_PRIMITIVETYPE_POINTS || primitive_type == SG_PRIMITIVETYPE_LINES || primitive_type == SG_PRIMITIVETYPE_LINE_STRIP) ? _sgp.state.thickness : 0.0f;
     sgp_color_ub4 color = _sgp.state.color;
-    sgp_mat2x3 mvp = _sgp.state.mvp; // copy to stack for more efficiency
-    _sgp_region region = {FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX};
-    for (uint32_t i=0;i<num_vertices;++i) {
-        sgp_vec2 p = _sgp_mat3_vec2_mul(&mvp, &vertices[i]);
-        region.x1 = _sg_min(region.x1, p.x - thickness);
-        region.y1 = _sg_min(region.y1, p.y - thickness);
-        region.x2 = _sg_max(region.x2, p.x + thickness);
-        region.y2 = _sg_max(region.y2, p.y + thickness);
-        v[i].position = p;
-        v[i].texcoord.x = 0.0f;
-        v[i].texcoord.y = 0.0f;
-        v[i].color = color;
-    }
-
-    // queue draw
+    sgp_mat2x3 mvp = _sgp.state.mvp;
     sg_pipeline pip = _sgp_lookup_pipeline(primitive_type, _sgp.state.blend_mode);
-    _sgp_queue_draw(pip, region, vertex_index, num_vertices, primitive_type);
+
+    uint32_t offset = 0;
+    while (offset < num_vertices) {
+        // Calculate chunk size
+        uint32_t chunk_size = num_vertices - offset;
+        if (prim_size > 0 && chunk_size > max_chunk) {
+            chunk_size = max_chunk;
+        }
+
+        // setup vertices
+        sgp_vertex* v = _sgp_next_vertices(chunk_size);
+        if (SOKOL_UNLIKELY(!v)) {
+            return;
+        }
+        uint32_t vertex_index = _sgp.cur_vertex - chunk_size;
+
+        // fill vertices
+        _sgp_region region = {FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX};
+        for (uint32_t i = 0; i < chunk_size; ++i) {
+            sgp_vec2 p = _sgp_mat3_vec2_mul(&mvp, &vertices[offset + i]);
+            region.x1 = _sg_min(region.x1, p.x - thickness);
+            region.y1 = _sg_min(region.y1, p.y - thickness);
+            region.x2 = _sg_max(region.x2, p.x + thickness);
+            region.y2 = _sg_max(region.y2, p.y + thickness);
+            v[i].position = p;
+            v[i].texcoord.x = 0.0f;
+            v[i].texcoord.y = 0.0f;
+            v[i].color = color;
+        }
+
+        // queue draw
+        _sgp_queue_draw(pip, region, vertex_index, chunk_size, primitive_type);
+
+        offset += chunk_size;
+    }
 }
 
 void sgp_draw_points(const sgp_point* points, uint32_t count) {
@@ -2916,11 +2986,11 @@ void sgp_draw_filled_rects(const sgp_rect* rects, uint32_t count) {
 
     // setup vertices
     uint32_t num_vertices = count * 6;
-    uint32_t vertex_index = _sgp.cur_vertex;
     sgp_vertex* vertices = _sgp_next_vertices(num_vertices);
     if (SOKOL_UNLIKELY(!vertices)) {
         return;
     }
+    uint32_t vertex_index = _sgp.cur_vertex - num_vertices;
 
     // compute vertices
     sgp_vertex* v = vertices;
@@ -3015,11 +3085,11 @@ void sgp_draw_textured_rects(int channel, const sgp_textured_rect* rects, uint32
 
     // setup vertices
     uint32_t num_vertices = count * 6;
-    uint32_t vertex_index = _sgp.cur_vertex;
     sgp_vertex* vertices = _sgp_next_vertices(num_vertices);
     if (SOKOL_UNLIKELY(!vertices)) {
         return;
     }
+    uint32_t vertex_index = _sgp.cur_vertex - num_vertices;
 
     // compute image values used for texture coords transform
     sgp_isize image_size = _sgp_query_view_size(view);
