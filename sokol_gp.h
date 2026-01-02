@@ -700,6 +700,16 @@ enum {
     _SGP_MAX_STACK_DEPTH = 64
 };
 
+// Realloc helper - sokol only provides malloc/free
+static void* _sgp_realloc(void* ptr, size_t old_size, size_t new_size) {
+    void* new_ptr = _sg_malloc(new_size);
+    if (new_ptr && ptr) {
+        memcpy(new_ptr, ptr, old_size < new_size ? old_size : new_size);
+        _sg_free(ptr);
+    }
+    return new_ptr;
+}
+
 typedef struct _sgp_region {
     float x1, y1, x2, y2;
 } _sgp_region;
@@ -2002,17 +2012,14 @@ void sgp_begin(int width, int height) {
     }
 }
 
-void sgp_flush(void) {
+// Internal: execute draw commands without resetting counters
+// Used for flushing before buffer resize
+static void _sgp_flush_draw(void) {
     SOKOL_ASSERT(_sgp.init_cookie == _SGP_INIT_COOKIE);
     SOKOL_ASSERT(_sgp.cur_state > 0);
 
     uint32_t end_command = _sgp.cur_command;
     uint32_t end_vertex = _sgp.cur_vertex;
-
-    // rewind indexes
-    _sgp.cur_vertex = _sgp.state._base_vertex;
-    _sgp.cur_uniform = _sgp.state._base_uniform;
-    _sgp.cur_command = _sgp.state._base_command;
 
     // draw nothing on errors
     if (_sgp.last_error != SGP_NO_ERROR) {
@@ -2124,6 +2131,19 @@ void sgp_flush(void) {
             }
         }
     }
+}
+
+void sgp_flush(void) {
+    SOKOL_ASSERT(_sgp.init_cookie == _SGP_INIT_COOKIE);
+    SOKOL_ASSERT(_sgp.cur_state > 0);
+
+    // Execute all pending draw commands
+    _sgp_flush_draw();
+
+    // Rewind indexes for next batch
+    _sgp.cur_vertex = _sgp.state._base_vertex;
+    _sgp.cur_uniform = _sgp.state._base_uniform;
+    _sgp.cur_command = _sgp.state._base_command;
 }
 
 void sgp_end(void) {
@@ -2372,15 +2392,109 @@ void sgp_reset_sampler(int channel) {
     sgp_set_sampler(channel, _sgp.nearest_smp);
 }
 
+// Reset all buffer counters to 0 (used after buffer resize)
+static void _sgp_reset_counters(void) {
+    _sgp.cur_vertex = 0;
+    _sgp.cur_uniform = 0;
+    _sgp.cur_command = 0;
+    _sgp.state._base_vertex = 0;
+    _sgp.state._base_uniform = 0;
+    _sgp.state._base_command = 0;
+}
+
+// Grow vertex buffer (CPU array + GPU buffer)
+static bool _sgp_grow_vertex_buffer(uint32_t min_vertices) {
+    // Calculate new size (2x growth, at least min_vertices)
+    uint32_t new_size = _sgp.num_vertices * 2;
+    while (new_size < min_vertices) {
+        new_size *= 2;
+    }
+
+    // Reallocate CPU buffer
+    size_t old_bytes = _sgp.num_vertices * sizeof(sgp_vertex);
+    size_t new_bytes = new_size * sizeof(sgp_vertex);
+    void* new_vertices = _sgp_realloc(_sgp.vertices, old_bytes, new_bytes);
+    if (!new_vertices) {
+        return false;
+    }
+    _sgp.vertices = (sgp_vertex*)new_vertices;
+
+    // Destroy old GPU buffer and create new one
+    sg_destroy_buffer(_sgp.vertex_buf);
+    sg_buffer_desc vertex_buf_desc;
+    memset(&vertex_buf_desc, 0, sizeof(sg_buffer_desc));
+    vertex_buf_desc.size = new_bytes;
+    vertex_buf_desc.usage = (sg_buffer_usage){
+        .vertex_buffer = true,
+        .stream_update = true,
+    };
+    _sgp.vertex_buf = sg_make_buffer(&vertex_buf_desc);
+    if (sg_query_buffer_state(_sgp.vertex_buf) != SG_RESOURCESTATE_VALID) {
+        return false;
+    }
+
+    _sgp.num_vertices = new_size;
+    return true;
+}
+
+// Grow uniform buffer (CPU array only)
+static bool _sgp_grow_uniform_buffer(uint32_t min_uniforms) {
+    uint32_t new_size = _sgp.num_uniforms * 2;
+    while (new_size < min_uniforms) {
+        new_size *= 2;
+    }
+
+    size_t old_bytes = _sgp.num_uniforms * sizeof(sgp_uniform);
+    size_t new_bytes = new_size * sizeof(sgp_uniform);
+    void* new_uniforms = _sgp_realloc(_sgp.uniforms, old_bytes, new_bytes);
+    if (!new_uniforms) {
+        return false;
+    }
+    _sgp.uniforms = (sgp_uniform*)new_uniforms;
+    _sgp.num_uniforms = new_size;
+    return true;
+}
+
+// Grow command buffer (CPU array only)
+static bool _sgp_grow_command_buffer(uint32_t min_commands) {
+    uint32_t new_size = _sgp.num_commands * 2;
+    while (new_size < min_commands) {
+        new_size *= 2;
+    }
+
+    size_t old_bytes = _sgp.num_commands * sizeof(_sgp_command);
+    size_t new_bytes = new_size * sizeof(_sgp_command);
+    void* new_commands = _sgp_realloc(_sgp.commands, old_bytes, new_bytes);
+    if (!new_commands) {
+        return false;
+    }
+    _sgp.commands = (_sgp_command*)new_commands;
+    _sgp.num_commands = new_size;
+    return true;
+}
+
 static sgp_vertex* _sgp_next_vertices(uint32_t count) {
     if (SOKOL_LIKELY(_sgp.cur_vertex + count <= _sgp.num_vertices)) {
         sgp_vertex *vertices = &_sgp.vertices[_sgp.cur_vertex];
         _sgp.cur_vertex += count;
         return vertices;
-    } else {
-        _sgp_set_error(SGP_ERROR_VERTICES_FULL);
+    }
+
+    // Overflow: flush current draws, grow buffer, and retry
+    _sgp_flush_draw();
+
+    if (!_sgp_grow_vertex_buffer(count)) {
+        _sgp_set_error(SGP_ERROR_ALLOC_FAILED);
         return NULL;
     }
+
+    // Reset all counters to start fresh in the new buffer
+    _sgp_reset_counters();
+
+    // Allocate from fresh buffer
+    sgp_vertex *vertices = &_sgp.vertices[0];
+    _sgp.cur_vertex = count;
+    return vertices;
 }
 
 static sgp_uniform* _sgp_prev_uniform(void) {
@@ -2394,10 +2508,20 @@ static sgp_uniform* _sgp_prev_uniform(void) {
 static sgp_uniform* _sgp_next_uniform(void) {
     if (SOKOL_LIKELY(_sgp.cur_uniform < _sgp.num_uniforms)) {
         return &_sgp.uniforms[_sgp.cur_uniform++];
-    } else {
-        _sgp_set_error(SGP_ERROR_UNIFORMS_FULL);
+    }
+
+    // Overflow: flush current draws, grow buffer, and retry
+    _sgp_flush_draw();
+
+    if (!_sgp_grow_uniform_buffer(_sgp.num_uniforms + 1)) {
+        _sgp_set_error(SGP_ERROR_ALLOC_FAILED);
         return NULL;
     }
+
+    // Reset all counters to start fresh
+    _sgp_reset_counters();
+
+    return &_sgp.uniforms[_sgp.cur_uniform++];
 }
 
 static _sgp_command* _sgp_prev_command(uint32_t count) {
@@ -2411,10 +2535,20 @@ static _sgp_command* _sgp_prev_command(uint32_t count) {
 static _sgp_command* _sgp_next_command(void) {
     if (SOKOL_LIKELY(_sgp.cur_command < _sgp.num_commands)) {
         return &_sgp.commands[_sgp.cur_command++];
-    } else {
-        _sgp_set_error(SGP_ERROR_COMMANDS_FULL);
+    }
+
+    // Overflow: flush current draws, grow buffer, and retry
+    _sgp_flush_draw();
+
+    if (!_sgp_grow_command_buffer(_sgp.num_commands + 1)) {
+        _sgp_set_error(SGP_ERROR_ALLOC_FAILED);
         return NULL;
     }
+
+    // Reset all counters to start fresh
+    _sgp_reset_counters();
+
+    return &_sgp.commands[_sgp.cur_command++];
 }
 
 void sgp_viewport(int x, int y, int w, int h) {
